@@ -19,7 +19,9 @@ service cloud.firestore {
     }
 
     function validateEventShape(data) {
-      return isValidEventTitle(data) && isValidEventCapacity(data) && isValidEventDate(data);
+      return isValidEventTitle(data) && isValidEventCapacity(data) && isValidEventDate(data)
+        && (!('campusId' in data) || data.campusId is string)
+        && (!('federatedToAll' in data) || data.federatedToAll is bool);
     }
 
     function isValidThemeColor(data) {
@@ -122,6 +124,17 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(userId)).data;
     }
 
+    function getUserCampus() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? getUserData(request.auth.uid).get('campusId', null)
+        : null;
+    }
+
+    function isSameCampus(campusId) {
+      return getUserCampus() == campusId;
+    }
+
+  
     // Validate that updates to the rate-limit fields are strictly valid increments or resets
     function validateRateLimitUpdate(userId) {
       let before = resource.data;
@@ -240,6 +253,11 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
+    match /institutions/{institutionId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
     // Root-level Certificates Collection
     match /certificates/{certId} {
       allow read: if request.auth != null && (
@@ -261,13 +279,18 @@ service cloud.firestore {
     // EVENTS COLLECTION & SUBCOLLECTIONS
     // =========================================================================
 
-    match /events/{eventId} {
-      allow read: if request.auth != null;
-      
-      // Write operations with rate limit checks
+   match /events/{eventId} {
+      allow read: if request.auth != null && (
+        isAdmin() ||
+        (resource.data.get('federatedToAll', false) == true) ||
+        isSameCampus(resource.data.get('campusId', null)) ||
+        (getUserCampus() != null && getUserCampus() in resource.data.get('allowedCampusIds', []))
+      );
+
       allow create: if request.auth != null 
                     && (isAdmin() || (isClub() && checkWriteRate(request.auth.uid) && checkEventDailyRate(request.auth.uid)))
-                    && validateEventShape(request.resource.data);
+                    && validateEventShape(request.resource.data)
+                    && exists(/databases/$(database)/documents/institutions/$(request.resource.data.campusId));
       
       allow update: if request.auth != null 
                     && (isAdmin() || ('ownerId' in resource.data && request.auth.uid == resource.data.ownerId && checkWriteRate(request.auth.uid)))
@@ -276,7 +299,6 @@ service cloud.firestore {
       allow delete: if request.auth != null 
                     && (isAdmin() || ('ownerId' in resource.data && request.auth.uid == resource.data.ownerId));
 
-      // Attendance fallback subcollection
       match /attendance/{attendanceId} {
          allow read: if request.auth != null && (
            isAdmin() ||
@@ -292,7 +314,9 @@ service cloud.firestore {
              isEventOwner(database, eventId) ||
              isEventOwnerAfter(database, eventId)
            );
-      }
+    }
+
+      // Event Participants Registry
 
       // Event Participants Registry
       match /participants/{participantId} {
@@ -368,13 +392,20 @@ service cloud.firestore {
           isClub()
         ) && (!('userId' in request.resource.data) || request.resource.data.userId == request.auth.uid);
       }
-      
       // Volunteers List
       match /volunteers/{userId} {
         allow read: if true;
         // All writes must go through Cloud Functions to ensure proper point logging
         allow create, update, delete: if false; 
       }
+    }
+
+    match /eventTemplates/{templateId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.ownerId;
+      allow create: if request.auth != null
+                    && request.auth.uid == request.resource.data.ownerId;
+      allow update, delete: if request.auth != null
+                             && request.auth.uid == resource.data.ownerId;
     }
     
     // =========================================================================
